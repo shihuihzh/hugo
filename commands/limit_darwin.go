@@ -1,5 +1,4 @@
-// +build darwin
-// Copyright © 2013 Steve Francia <spf@spf13.com>.
+// Copyright 2018 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,36 +20,45 @@ import (
 	jww "github.com/spf13/jwalterweatherman"
 )
 
-func init() {
-	check.AddCommand(limit)
+var _ cmder = (*limitCmd)(nil)
+
+type limitCmd struct {
+	*baseCmd
 }
 
-var limit = &cobra.Command{
-	Use:   "ulimit",
-	Short: "Check system ulimit settings",
-	Long: `Hugo will inspect the current ulimit settings on the system.
-    This is primarily to ensure that Hugo can watch enough files on some OSs`,
-	Run: func(cmd *cobra.Command, args []string) {
-		var rLimit syscall.Rlimit
-		err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
-		if err != nil {
-			jww.ERROR.Println("Error Getting Rlimit ", err)
-		}
-		jww.FEEDBACK.Println("Current rLimit:", rLimit)
+func newLimitCmd() *limitCmd {
+	ccmd := &cobra.Command{
+		Use:   "ulimit",
+		Short: "Check system ulimit settings",
+		Long: `Hugo will inspect the current ulimit settings on the system.
+This is primarily to ensure that Hugo can watch enough files on some OSs`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var rLimit syscall.Rlimit
+			err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+			if err != nil {
+				return newSystemError("Error Getting Rlimit ", err)
+			}
 
-		jww.FEEDBACK.Println("Attempting to increase limit")
-		rLimit.Max = 999999
-		rLimit.Cur = 999999
-		err = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
-		if err != nil {
-			jww.ERROR.Println("Error Setting rLimit ", err)
-		}
-		err = syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
-		if err != nil {
-			jww.ERROR.Println("Error Getting rLimit ", err)
-		}
-		jww.FEEDBACK.Println("rLimit after change:", rLimit)
-	},
+			jww.FEEDBACK.Println("Current rLimit:", rLimit)
+
+			jww.FEEDBACK.Println("Attempting to increase limit")
+			rLimit.Max = 999999
+			rLimit.Cur = 999999
+			err = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+			if err != nil {
+				return newSystemError("Error Setting rLimit ", err)
+			}
+			err = syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+			if err != nil {
+				return newSystemError("Error Getting rLimit ", err)
+			}
+			jww.FEEDBACK.Println("rLimit after change:", rLimit)
+
+			return nil
+		},
+	}
+
+	return &limitCmd{baseCmd: newBaseCmd(ccmd)}
 }
 
 func tweakLimit() {
@@ -60,11 +68,11 @@ func tweakLimit() {
 		jww.ERROR.Println("Unable to obtain rLimit", err)
 	}
 	if rLimit.Cur < rLimit.Max {
-		rLimit.Max = 999999
-		rLimit.Cur = 999999
+		rLimit.Max = 64000
+		rLimit.Cur = 64000
 		err = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
 		if err != nil {
-			jww.ERROR.Println("Unable to increase number of open files limit", err)
+			jww.WARN.Println("Unable to increase number of open files limit", err)
 		}
 	}
 }

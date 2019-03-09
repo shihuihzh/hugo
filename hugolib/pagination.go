@@ -1,4 +1,4 @@
-// Copyright © 2013-14 Steve Francia <spf@spf13.com>.
+// Copyright 2015 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,29 +16,37 @@ package hugolib
 import (
 	"errors"
 	"fmt"
-	"github.com/spf13/cast"
-	"github.com/spf13/hugo/helpers"
-	"github.com/spf13/viper"
 	"html/template"
 	"math"
-	"path"
 	"reflect"
 	"strings"
+
+	"github.com/gohugoio/hugo/config"
+
+	"github.com/spf13/cast"
 )
 
+// Pager represents one of the elements in a paginator.
+// The number, starting on 1, represents its place.
 type Pager struct {
 	number int
 	*paginator
+}
+
+func (p Pager) String() string {
+	return fmt.Sprintf("Pager %d", p.number)
 }
 
 type paginatedElement interface {
 	Len() int
 }
 
+// Len returns the number of pages in the list.
 func (p Pages) Len() int {
 	return len(p)
 }
 
+// Len returns the number of pages in the page group.
 func (psg PagesGroup) Len() int {
 	l := 0
 	for _, pg := range psg {
@@ -49,8 +57,10 @@ func (psg PagesGroup) Len() int {
 
 type pagers []*Pager
 
-var paginatorEmptyPages Pages
-var paginatorEmptyPageGroups PagesGroup
+var (
+	paginatorEmptyPages      Pages
+	paginatorEmptyPageGroups PagesGroup
+)
 
 type paginator struct {
 	paginatedElements []paginatedElement
@@ -208,14 +218,16 @@ func splitPages(pages Pages, size int) []paginatedElement {
 }
 
 func splitPageGroups(pageGroups PagesGroup, size int) []paginatedElement {
-	var split []paginatedElement
 
 	type keyPage struct {
 		key  interface{}
 		page *Page
 	}
 
-	var flattened []keyPage
+	var (
+		split     []paginatedElement
+		flattened []keyPage
+	)
 
 	for _, g := range pageGroups {
 		for _, p := range g.Pages {
@@ -227,9 +239,13 @@ func splitPageGroups(pageGroups PagesGroup, size int) []paginatedElement {
 
 	for low, j := 0, numPages; low < j; low += size {
 		high := int(math.Min(float64(low+size), float64(numPages)))
-		var pg PagesGroup
-		var key interface{} = nil
-		var groupIndex = -1
+
+		var (
+			pg         PagesGroup
+			key        interface{}
+			groupIndex = -1
+		)
+
 		for k := low; k < high; k++ {
 			kp := flattened[k]
 			if key == nil || key != kp.key {
@@ -245,11 +261,18 @@ func splitPageGroups(pageGroups PagesGroup, size int) []paginatedElement {
 	return split
 }
 
-// Paginator gets this Node's paginator if it's already created.
-// If it's not, one will be created with all pages in Data["Pages"].
-func (n *Node) Paginator(options ...interface{}) (*Pager, error) {
+// Paginator get this Page's main output's paginator.
+func (p *Page) Paginator(options ...interface{}) (*Pager, error) {
+	return p.mainPageOutput.Paginator(options...)
+}
 
-	pagerSize, err := resolvePagerSize(options...)
+// Paginator gets this PageOutput's paginator if it's already created.
+// If it's not, one will be created with all pages in Data["Pages"].
+func (p *PageOutput) Paginator(options ...interface{}) (*Pager, error) {
+	if !p.IsNode() {
+		return nil, fmt.Errorf("Paginators not supported for pages of type %q (%q)", p.Kind, p.title)
+	}
+	pagerSize, err := resolvePagerSize(p.s.Cfg, options...)
 
 	if err != nil {
 		return nil, err
@@ -257,12 +280,16 @@ func (n *Node) Paginator(options ...interface{}) (*Pager, error) {
 
 	var initError error
 
-	n.paginatorInit.Do(func() {
-		if n.paginator != nil {
+	p.paginatorInit.Do(func() {
+		if p.paginator != nil {
 			return
 		}
 
-		pagers, err := paginatePages(n.Data["Pages"], pagerSize, n.URL)
+		pathDescriptor := p.targetPathDescriptor
+		if p.s.owner.IsMultihost() {
+			pathDescriptor.LangPrefix = ""
+		}
+		pagers, err := paginatePages(pathDescriptor, p.data["Pages"], pagerSize)
 
 		if err != nil {
 			initError = err
@@ -270,10 +297,9 @@ func (n *Node) Paginator(options ...interface{}) (*Pager, error) {
 
 		if len(pagers) > 0 {
 			// the rest of the nodes will be created later
-			n.paginator = pagers[0]
-			n.paginator.source = "paginator"
-			n.paginator.options = options
-			n.Site.addToPaginationPageCount(uint64(n.paginator.TotalPages()))
+			p.paginator = pagers[0]
+			p.paginator.source = "paginator"
+			p.paginator.options = options
 		}
 
 	})
@@ -282,25 +308,23 @@ func (n *Node) Paginator(options ...interface{}) (*Pager, error) {
 		return nil, initError
 	}
 
-	return n.paginator, nil
+	return p.paginator, nil
 }
 
-// Paginator on Page isn't supported, calling this yields an error.
-func (p *Page) Paginator(options ...interface{}) (*Pager, error) {
-	return nil, errors.New("Paginators not supported for content pages.")
-}
-
-// Paginate on Page isn't supported, calling this yields an error.
+// Paginate invokes this Page's main output's Paginate method.
 func (p *Page) Paginate(seq interface{}, options ...interface{}) (*Pager, error) {
-	return nil, errors.New("Paginators not supported for content pages.")
+	return p.mainPageOutput.Paginate(seq, options...)
 }
 
-// Paginate gets this Node's paginator if it's already created.
+// Paginate gets this PageOutput's paginator if it's already created.
 // If it's not, one will be created with the qiven sequence.
 // Note that repeated calls will return the same result, even if the sequence is different.
-func (n *Node) Paginate(seq interface{}, options ...interface{}) (*Pager, error) {
+func (p *PageOutput) Paginate(seq interface{}, options ...interface{}) (*Pager, error) {
+	if !p.IsNode() {
+		return nil, fmt.Errorf("Paginators not supported for pages of type %q (%q)", p.Kind, p.title)
+	}
 
-	pagerSize, err := resolvePagerSize(options...)
+	pagerSize, err := resolvePagerSize(p.s.Cfg, options...)
 
 	if err != nil {
 		return nil, err
@@ -308,11 +332,16 @@ func (n *Node) Paginate(seq interface{}, options ...interface{}) (*Pager, error)
 
 	var initError error
 
-	n.paginatorInit.Do(func() {
-		if n.paginator != nil {
+	p.paginatorInit.Do(func() {
+		if p.paginator != nil {
 			return
 		}
-		pagers, err := paginatePages(seq, pagerSize, n.URL)
+
+		pathDescriptor := p.targetPathDescriptor
+		if p.s.owner.IsMultihost() {
+			pathDescriptor.LangPrefix = ""
+		}
+		pagers, err := paginatePages(pathDescriptor, seq, pagerSize)
 
 		if err != nil {
 			initError = err
@@ -320,10 +349,9 @@ func (n *Node) Paginate(seq interface{}, options ...interface{}) (*Pager, error)
 
 		if len(pagers) > 0 {
 			// the rest of the nodes will be created later
-			n.paginator = pagers[0]
-			n.paginator.source = seq
-			n.paginator.options = options
-			n.Site.addToPaginationPageCount(uint64(n.paginator.TotalPages()))
+			p.paginator = pagers[0]
+			p.paginator.source = seq
+			p.paginator.options = options
 		}
 
 	})
@@ -332,20 +360,20 @@ func (n *Node) Paginate(seq interface{}, options ...interface{}) (*Pager, error)
 		return nil, initError
 	}
 
-	if n.paginator.source == "paginator" {
+	if p.paginator.source == "paginator" {
 		return nil, errors.New("a Paginator was previously built for this Node without filters; look for earlier .Paginator usage")
 	}
 
-	if !reflect.DeepEqual(options, n.paginator.options) || !probablyEqualPageLists(n.paginator.source, seq) {
+	if !reflect.DeepEqual(options, p.paginator.options) || !probablyEqualPageLists(p.paginator.source, seq) {
 		return nil, errors.New("invoked multiple times with different arguments")
 	}
 
-	return n.paginator, nil
+	return p.paginator, nil
 }
 
-func resolvePagerSize(options ...interface{}) (int, error) {
+func resolvePagerSize(cfg config.Provider, options ...interface{}) (int, error) {
 	if len(options) == 0 {
-		return viper.GetInt("paginate"), nil
+		return cfg.GetInt("paginate"), nil
 	}
 
 	if len(options) > 1 {
@@ -361,18 +389,21 @@ func resolvePagerSize(options ...interface{}) (int, error) {
 	return pas, nil
 }
 
-func paginatePages(seq interface{}, pagerSize int, section string) (pagers, error) {
+func paginatePages(td targetPathDescriptor, seq interface{}, pagerSize int) (pagers, error) {
 
 	if pagerSize <= 0 {
 		return nil, errors.New("'paginate' configuration setting must be positive to paginate")
 	}
 
-	section = strings.TrimSuffix(section, ".html")
-	urlFactory := newPaginationURLFactory(section)
+	urlFactory := newPaginationURLFactory(td)
 
 	var paginator *paginator
 
-	if groups, ok := seq.(PagesGroup); ok {
+	groups, err := toPagesGroup(seq)
+	if err != nil {
+		return nil, err
+	}
+	if groups != nil {
 		paginator, _ = newPaginatorFromPageGroups(groups, pagerSize, urlFactory)
 	} else {
 		pages, err := toPages(seq)
@@ -387,19 +418,69 @@ func paginatePages(seq interface{}, pagerSize int, section string) (pagers, erro
 	return pagers, nil
 }
 
-func toPages(seq interface{}) (Pages, error) {
-	switch seq.(type) {
-	case Pages:
-		return seq.(Pages), nil
-	case *Pages:
-		return *(seq.(*Pages)), nil
-	case WeightedPages:
-		return (seq.(WeightedPages)).Pages(), nil
-	case PageGroup:
-		return (seq.(PageGroup)).Pages, nil
-	default:
-		return nil, fmt.Errorf("unsupported type in paginate, got %T", seq)
+func toPagesGroup(seq interface{}) (PagesGroup, error) {
+	switch v := seq.(type) {
+	case nil:
+		return nil, nil
+	case PagesGroup:
+		return v, nil
+	case []PageGroup:
+		return PagesGroup(v), nil
+	case []interface{}:
+		l := len(v)
+		if l == 0 {
+			break
+		}
+		switch v[0].(type) {
+		case PageGroup:
+			pagesGroup := make(PagesGroup, l)
+			for i, ipg := range v {
+				if pg, ok := ipg.(PageGroup); ok {
+					pagesGroup[i] = pg
+				} else {
+					return nil, fmt.Errorf("unsupported type in paginate from slice, got %T instead of PageGroup", ipg)
+				}
+			}
+			return PagesGroup(pagesGroup), nil
+		}
 	}
+
+	return nil, nil
+}
+
+func toPages(seq interface{}) (Pages, error) {
+	if seq == nil {
+		return Pages{}, nil
+	}
+
+	switch v := seq.(type) {
+	case Pages:
+		return v, nil
+	case *Pages:
+		return *(v), nil
+	case []*Page:
+		return Pages(v), nil
+	case WeightedPages:
+		return v.Pages(), nil
+	case PageGroup:
+		return v.Pages, nil
+	case []interface{}:
+		pages := make(Pages, len(v))
+		success := true
+		for i, vv := range v {
+			p, ok := vv.(*Page)
+			if !ok {
+				success = false
+				break
+			}
+			pages[i] = p
+		}
+		if success {
+			return pages, nil
+		}
+	}
+
+	return nil, fmt.Errorf("cannot convert type %T to Pages", seq)
 }
 
 // probablyEqual checks page lists for probable equality.
@@ -495,17 +576,20 @@ func newPaginator(elements []paginatedElement, total, size int, urlFactory pagin
 	return p, nil
 }
 
-func newPaginationURLFactory(pathElements ...string) paginationURLFactory {
-	paginatePath := viper.GetString("paginatePath")
+func newPaginationURLFactory(d targetPathDescriptor) paginationURLFactory {
 
 	return func(page int) string {
+		pathDescriptor := d
 		var rel string
-		if page == 1 {
-			rel = fmt.Sprintf("/%s/", path.Join(pathElements...))
-		} else {
-			rel = fmt.Sprintf("/%s/%s/%d/", path.Join(pathElements...), paginatePath, page)
+		if page > 1 {
+			rel = fmt.Sprintf("/%s/%d/", d.PathSpec.PaginatePath, page)
+			pathDescriptor.Addends = rel
 		}
 
-		return helpers.URLizeAndPrep(rel)
+		targetPath := createTargetPath(pathDescriptor)
+		targetPath = strings.TrimSuffix(targetPath, d.Type.BaseFilename())
+		link := d.PathSpec.PrependBasePath(targetPath, false)
+		// Note: The targetPath is massaged with MakePathSanitized
+		return d.PathSpec.URLizeFilename(link)
 	}
 }

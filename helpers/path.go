@@ -1,4 +1,4 @@
-// Copyright © 2014 Steve Francia <spf@spf13.com>.
+// Copyright 2015 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,17 +16,26 @@ package helpers
 import (
 	"errors"
 	"fmt"
-	"github.com/spf13/afero"
-	jww "github.com/spf13/jwalterweatherman"
-	"github.com/spf13/viper"
-	"golang.org/x/text/transform"
-	"golang.org/x/text/unicode/norm"
 	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode"
+
+	"github.com/gohugoio/hugo/config"
+
+	"github.com/gohugoio/hugo/common/hugio"
+	_errors "github.com/pkg/errors"
+	"github.com/spf13/afero"
+	"golang.org/x/text/transform"
+	"golang.org/x/text/unicode/norm"
+)
+
+var (
+	// ErrThemeUndefined is returned when a theme has not be defined by the user.
+	ErrThemeUndefined = errors.New("no theme set")
 )
 
 // filepathPathBridge is a bridge for common functionality in filepath vs path
@@ -67,43 +76,77 @@ func (filepathBridge) Separator() string {
 }
 
 var fpb filepathBridge
-var sanitizeRegexp = regexp.MustCompile("[^a-zA-Z0-9./_-]")
 
 // MakePath takes a string with any characters and replace it
 // so the string could be used in a path.
 // It does so by creating a Unicode-sanitized string, with the spaces replaced,
 // whilst preserving the original casing of the string.
 // E.g. Social Media -> Social-Media
-func MakePath(s string) string {
-	return UnicodeSanitize(strings.Replace(strings.TrimSpace(s), " ", "-", -1))
+func (p *PathSpec) MakePath(s string) string {
+	return p.UnicodeSanitize(s)
 }
 
 // MakePathSanitized creates a Unicode-sanitized string, with the spaces replaced
-func MakePathSanitized(s string) string {
-	if viper.GetBool("DisablePathToLower") {
-		return MakePath(s)
-	} else {
-		return strings.ToLower(MakePath(s))
+func (p *PathSpec) MakePathSanitized(s string) string {
+	if p.DisablePathToLower {
+		return p.MakePath(s)
 	}
+	return strings.ToLower(p.MakePath(s))
 }
 
+// ToSlashTrimLeading is just a filepath.ToSlaas with an added / prefix trimmer.
+func ToSlashTrimLeading(s string) string {
+	return strings.TrimPrefix(filepath.ToSlash(s), "/")
+}
+
+// MakeTitle converts the path given to a suitable title, trimming whitespace
+// and replacing hyphens with whitespace.
 func MakeTitle(inpath string) string {
 	return strings.Replace(strings.TrimSpace(inpath), "-", " ", -1)
 }
 
-func UnicodeSanitize(s string) string {
+// From https://golang.org/src/net/url/url.go
+func ishex(c rune) bool {
+	switch {
+	case '0' <= c && c <= '9':
+		return true
+	case 'a' <= c && c <= 'f':
+		return true
+	case 'A' <= c && c <= 'F':
+		return true
+	}
+	return false
+}
+
+// UnicodeSanitize sanitizes string to be used in Hugo URL's, allowing only
+// a predefined set of special Unicode characters.
+// If RemovePathAccents configuration flag is enabled, Uniccode accents
+// are also removed.
+// Spaces will be replaced with a single hyphen, and sequential hyphens will be reduced to one.
+func (p *PathSpec) UnicodeSanitize(s string) string {
 	source := []rune(s)
 	target := make([]rune, 0, len(source))
+	var prependHyphen bool
 
-	for _, r := range source {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsMark(r) || r == '.' || r == '/' || r == '\\' || r == '_' || r == '-' || r == '#' {
+	for i, r := range source {
+		isAllowed := r == '.' || r == '/' || r == '\\' || r == '_' || r == '#' || r == '+' || r == '~'
+		isAllowed = isAllowed || unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsMark(r)
+		isAllowed = isAllowed || (r == '%' && i+2 < len(source) && ishex(source[i+1]) && ishex(source[i+2]))
+
+		if isAllowed {
+			if prependHyphen {
+				target = append(target, '-')
+				prependHyphen = false
+			}
 			target = append(target, r)
+		} else if len(target) > 0 && (r == '-' || unicode.IsSpace(r)) {
+			prependHyphen = true
 		}
 	}
 
 	var result string
 
-	if viper.GetBool("RemovePathAccents") {
+	if p.RemovePathAccents {
 		// remove accents - see https://blog.golang.org/normalization
 		t := transform.Chain(norm.NFD, transform.RemoveFunc(isMn), norm.NFC)
 		result, _, _ = transform.String(t, string(target))
@@ -125,134 +168,33 @@ func ReplaceExtension(path string, newExt string) string {
 	return f + "." + newExt
 }
 
-// DirExists checks if a path exists and is a directory.
-func DirExists(path string, fs afero.Fs) (bool, error) {
-	fi, err := fs.Stat(path)
-	if err == nil && fi.IsDir() {
-		return true, nil
-	}
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	return false, err
-}
-
-// IsDir checks if a given path is a directory.
-func IsDir(path string, fs afero.Fs) (bool, error) {
-	fi, err := fs.Stat(path)
-	if err != nil {
-		return false, err
-	}
-	return fi.IsDir(), nil
-}
-
-// IsEmpty checks if a given path is empty.
-func IsEmpty(path string, fs afero.Fs) (bool, error) {
-	if b, _ := Exists(path, fs); !b {
-		return false, fmt.Errorf("%q path does not exist", path)
-	}
-	fi, err := fs.Stat(path)
-	if err != nil {
-		return false, err
-	}
-	if fi.IsDir() {
-		f, err := os.Open(path)
-		// FIX: Resource leak - f.close() should be called here by defer or is missed
-		// if the err != nil branch is taken.
-		defer f.Close()
-		if err != nil {
-			return false, err
-		}
-		list, err := f.Readdir(-1)
-		// f.Close() - see bug fix above
-		return len(list) == 0, nil
-	}
-	return fi.Size() == 0, nil
-}
-
-// Check if a file contains a specified string.
-func FileContains(filename string, subslice []byte, fs afero.Fs) (bool, error) {
-	f, err := os.Open(filename)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-
-	return ReaderContains(f, subslice), nil
-}
-
-// Check if a file or directory exists.
-func Exists(path string, fs afero.Fs) (bool, error) {
-	_, err := fs.Stat(path)
-	if err == nil {
-		return true, nil
-	}
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	return false, err
-}
-
-func AbsPathify(inPath string) string {
-	if filepath.IsAbs(inPath) {
-		return filepath.Clean(inPath)
-	}
-
-	// todo consider move workingDir to argument list
-	return filepath.Clean(filepath.Join(viper.GetString("WorkingDir"), inPath))
-}
-
-func GetStaticDirPath() string {
-	return AbsPathify(viper.GetString("StaticDir"))
-}
-
-// Get the root directory of the current theme, if there is one.
+// GetFirstThemeDir gets the root directory of the first theme, if there is one.
 // If there is no theme, returns the empty string.
-func GetThemeDir() string {
-	if ThemeSet() {
-		return AbsPathify(filepath.Join("themes", viper.GetString("theme")))
+func (p *PathSpec) GetFirstThemeDir() string {
+	if p.ThemeSet() {
+		return p.AbsPathify(filepath.Join(p.ThemesDir, p.Themes()[0]))
 	}
 	return ""
 }
 
-// GetThemeStaticDirPath returns the theme's static dir path if theme is set.
-// If theme is set and the static dir doesn't exist, an error is returned.
-func GetThemeStaticDirPath() (string, error) {
-	return getThemeDirPath("static")
-}
-
-// GetThemeStaticDirPath returns the theme's data dir path if theme is set.
-// If theme is set and the data dir doesn't exist, an error is returned.
-func GetThemeDataDirPath() (string, error) {
-	return getThemeDirPath("data")
-}
-
-func getThemeDirPath(path string) (string, error) {
-	var themeDir string
-	if ThemeSet() {
-		themeDir = filepath.Join(GetThemeDir(), path)
-		if _, err := os.Stat(themeDir); os.IsNotExist(err) {
-			return "", fmt.Errorf("Unable to find %s directory for theme %s in %s", path, viper.GetString("theme"), themeDir)
-		}
+// GetThemesDir gets the absolute root theme dir path.
+func (p *PathSpec) GetThemesDir() string {
+	if p.ThemeSet() {
+		return p.AbsPathify(p.ThemesDir)
 	}
-	return themeDir, nil
+	return ""
 }
 
-// Get the 'static' directory of the current theme, if there is one.
-// Ignores underlying errors. Candidate for deprecation?
-func GetThemesDirPath() string {
-	dir, _ := getThemeDirPath("static")
-	return dir
+// GetRelativeThemeDir gets the relative root directory of the current theme, if there is one.
+// If there is no theme, returns the empty string.
+func (p *PathSpec) GetRelativeThemeDir() string {
+	if p.ThemeSet() {
+		return strings.TrimPrefix(filepath.Join(p.ThemesDir, p.Themes()[0]), FilePathSeparator)
+	}
+	return ""
 }
 
-func MakeStaticPathRelative(inPath string) (string, error) {
-	staticDir := GetStaticDirPath()
-	themeStaticDir := GetThemesDirPath()
-
-	return MakePathRelative(inPath, staticDir, themeStaticDir)
-}
-
-func MakePathRelative(inPath string, possibleDirectories ...string) (string, error) {
+func makePathRelative(inPath string, possibleDirectories ...string) (string, error) {
 
 	for _, currentPath := range possibleDirectories {
 		if strings.HasPrefix(inPath, currentPath) {
@@ -263,23 +205,25 @@ func MakePathRelative(inPath string, possibleDirectories ...string) (string, err
 }
 
 // Should be good enough for Hugo.
-var isFileRe = regexp.MustCompile(".*\\..{1,6}$")
+var isFileRe = regexp.MustCompile(`.*\..{1,6}$`)
 
-// Expects a relative path starting after the content directory.
+// GetDottedRelativePath expects a relative path starting after the content directory.
+// It returns a relative path with dots ("..") navigating up the path structure.
 func GetDottedRelativePath(inPath string) string {
 	inPath = filepath.Clean(filepath.FromSlash(inPath))
+
 	if inPath == "." {
 		return "./"
 	}
-	isFile := isFileRe.MatchString(inPath)
-	if !isFile {
-		if !strings.HasSuffix(inPath, FilePathSeparator) {
-			inPath += FilePathSeparator
-		}
+
+	if !isFileRe.MatchString(inPath) && !strings.HasSuffix(inPath, FilePathSeparator) {
+		inPath += FilePathSeparator
 	}
+
 	if !strings.HasPrefix(inPath, FilePathSeparator) {
 		inPath = FilePathSeparator + inPath
 	}
+
 	dir, _ := filepath.Split(inPath)
 
 	sectionCount := strings.Count(dir, FilePathSeparator)
@@ -295,6 +239,35 @@ func GetDottedRelativePath(inPath string) string {
 	}
 
 	return dottedPath
+}
+
+// ExtNoDelimiter takes a path and returns the extension, excluding the delmiter, i.e. "md".
+func ExtNoDelimiter(in string) string {
+	return strings.TrimPrefix(Ext(in), ".")
+}
+
+// Ext takes a path and returns the extension, including the delmiter, i.e. ".md".
+func Ext(in string) string {
+	_, ext := fileAndExt(in, fpb)
+	return ext
+}
+
+// PathAndExt is the same as FileAndExt, but it uses the path package.
+func PathAndExt(in string) (string, string) {
+	return fileAndExt(in, pb)
+}
+
+// FileAndExt takes a path and returns the file and extension separated,
+// the extension including the delmiter, i.e. ".md".
+func FileAndExt(in string) (string, string) {
+	return fileAndExt(in, fpb)
+}
+
+// FileAndExtNoDelimiter takes a path and returns the file and extension separated,
+// the extension excluding the delmiter, e.g "md".
+func FileAndExtNoDelimiter(in string) (string, string) {
+	file, ext := fileAndExt(in, fpb)
+	return file, strings.TrimPrefix(ext, ".")
 }
 
 // Filename takes a path, strips out the extension,
@@ -368,56 +341,8 @@ func GetRelativePath(path, base string) (final string, err error) {
 	return name, nil
 }
 
-func PaginateAliasPath(base string, page int) string {
-	paginatePath := viper.GetString("paginatePath")
-	uglify := viper.GetBool("UglyURLs")
-	var p string
-	if base != "" {
-		p = filepath.FromSlash(fmt.Sprintf("/%s/%s/%d", base, paginatePath, page))
-	} else {
-		p = filepath.FromSlash(fmt.Sprintf("/%s/%d", paginatePath, page))
-	}
-	if uglify {
-		p += ".html"
-	}
-
-	return p
-}
-
-// GuessSection returns the section given a source path.
-// A section is the part between the root slash and the second slash
-// or before the first slash.
-func GuessSection(in string) string {
-	parts := strings.Split(in, FilePathSeparator)
-	// This will include an empty entry before and after paths with leading and trailing slashes
-	// eg... /sect/one/ -> ["", "sect", "one", ""]
-
-	// Needs to have at least a value and a slash
-	if len(parts) < 2 {
-		return ""
-	}
-
-	// If it doesn't have a leading slash and value and file or trailing slash, then return ""
-	if parts[0] == "" && len(parts) < 3 {
-		return ""
-	}
-
-	// strip leading slash
-	if parts[0] == "" {
-		parts = parts[1:]
-	}
-
-	// if first directory is "content", return second directory
-	if parts[0] == "content" {
-		if len(parts) > 2 {
-			return parts[1]
-		}
-		return ""
-	}
-
-	return parts[0]
-}
-
+// PathPrep prepares the path using the uglify setting to create paths on
+// either the form /section/name/index.html or /section/name.html.
 func PathPrep(ugly bool, in string) string {
 	if ugly {
 		return Uglify(in)
@@ -425,7 +350,7 @@ func PathPrep(ugly bool, in string) string {
 	return PrettifyPath(in)
 }
 
-// Same as PrettifyURLPath() but for file paths.
+// PrettifyPath is the same as PrettifyURLPath but for file paths.
 //     /section/name.html       becomes /section/name/index.html
 //     /section/name/           becomes /section/name/index.html
 //     /section/name/index.html becomes /section/name/index.html
@@ -439,7 +364,7 @@ func prettifyPath(in string, b filepathPathBridge) string {
 		if len(in) < 2 {
 			return b.Separator()
 		}
-		return b.Join(b.Clean(in), "index.html")
+		return b.Join(in, "index.html")
 	}
 	name, ext := fileAndExt(in, b)
 	if name == "index" {
@@ -450,7 +375,7 @@ func prettifyPath(in string, b filepathPathBridge) string {
 	return b.Join(b.Dir(in), name, "index"+ext)
 }
 
-// Extract the root paths from the supplied list of paths.
+// ExtractRootPaths extracts the root paths from the supplied list of paths.
 // The resulting root path will not contain any file separators, but there
 // may be duplicates.
 // So "/content/section/" becomes "content"
@@ -470,6 +395,8 @@ func ExtractRootPaths(paths []string) []string {
 	return r
 
 }
+
+var numInPathRe = regexp.MustCompile("\\.(\\d+)\\.")
 
 // FindCWD returns the current working directory from where the Hugo
 // executable is run.
@@ -496,90 +423,243 @@ func FindCWD() (string, error) {
 	return path, nil
 }
 
-// Same as WriteToDisk but checks to see if file/directory already exists.
-func SafeWriteToDisk(inpath string, r io.Reader, fs afero.Fs) (err error) {
-	dir, _ := filepath.Split(inpath)
-	ospath := filepath.FromSlash(dir)
+// SymbolicWalk is like filepath.Walk, but it supports the root being a
+// symbolic link. It will still not follow symbolic links deeper down in
+// the file structure.
+func SymbolicWalk(fs afero.Fs, root string, walker filepath.WalkFunc) error {
 
-	if ospath != "" {
-		err = fs.MkdirAll(ospath, 0777) // rwx, rw, r
-		if err != nil {
-			return
+	// Sanity check
+	if root != "" && len(root) < 4 {
+		return errors.New("Path is too short")
+	}
+
+	// Handle the root first
+	fileInfo, realPath, err := getRealFileInfo(fs, root)
+
+	if err != nil {
+		return walker(root, nil, err)
+	}
+
+	if !fileInfo.IsDir() {
+		return fmt.Errorf("Cannot walk regular file %s", root)
+	}
+
+	if err := walker(realPath, fileInfo, err); err != nil && err != filepath.SkipDir {
+		return err
+	}
+
+	// Some of Hugo's filesystems represents an ordered root folder, i.e. project first, then theme folders.
+	// Make sure that order is preserved. afero.Walk will sort the directories down in the file tree,
+	// but we don't care about that.
+	rootContent, err := readDir(fs, root, false)
+
+	if err != nil {
+		return walker(root, nil, err)
+	}
+
+	for _, fi := range rootContent {
+		if err := afero.Walk(fs, filepath.Join(root, fi.Name()), walker); err != nil {
+			return err
 		}
 	}
 
-	exists, err := Exists(inpath, fs)
-	if err != nil {
-		return
-	}
-	if exists {
-		return fmt.Errorf("%v already exists", inpath)
-	}
+	return nil
 
-	file, err := fs.Create(inpath)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-
-	_, err = io.Copy(file, r)
-	return
 }
 
-// Writes content to disk.
-func WriteToDisk(inpath string, r io.Reader, fs afero.Fs) (err error) {
-	dir, _ := filepath.Split(inpath)
-	ospath := filepath.FromSlash(dir)
+func readDir(fs afero.Fs, dirname string, doSort bool) ([]os.FileInfo, error) {
+	f, err := fs.Open(dirname)
+	if err != nil {
+		return nil, err
+	}
+	list, err := f.Readdir(-1)
+	f.Close()
+	if err != nil {
+		return nil, err
+	}
+	if doSort {
+		sort.Slice(list, func(i, j int) bool { return list[i].Name() < list[j].Name() })
+	}
+	return list, nil
+}
 
-	if ospath != "" {
-		err = fs.MkdirAll(ospath, 0777) // rwx, rw, r
+func getRealFileInfo(fs afero.Fs, path string) (os.FileInfo, string, error) {
+	fileInfo, err := LstatIfPossible(fs, path)
+	realPath := path
+
+	if err != nil {
+		return nil, "", err
+	}
+
+	if fileInfo.Mode()&os.ModeSymlink == os.ModeSymlink {
+		link, err := filepath.EvalSymlinks(path)
 		if err != nil {
-			if err != os.ErrExist {
-				jww.FATAL.Fatalln(err)
+			return nil, "", _errors.Wrapf(err, "Cannot read symbolic link %q", path)
+		}
+		fileInfo, err = LstatIfPossible(fs, link)
+		if err != nil {
+			return nil, "", _errors.Wrapf(err, "Cannot stat %q", link)
+		}
+		realPath = link
+	}
+	return fileInfo, realPath, nil
+}
+
+// GetRealPath returns the real file path for the given path, whether it is a
+// symlink or not.
+func GetRealPath(fs afero.Fs, path string) (string, error) {
+	_, realPath, err := getRealFileInfo(fs, path)
+
+	if err != nil {
+		return "", err
+	}
+
+	return realPath, nil
+}
+
+// LstatIfPossible can be used to call Lstat if possible, else Stat.
+func LstatIfPossible(fs afero.Fs, path string) (os.FileInfo, error) {
+	if lstater, ok := fs.(afero.Lstater); ok {
+		fi, _, err := lstater.LstatIfPossible(path)
+		return fi, err
+	}
+
+	return fs.Stat(path)
+}
+
+// SafeWriteToDisk is the same as WriteToDisk
+// but it also checks to see if file/directory already exists.
+func SafeWriteToDisk(inpath string, r io.Reader, fs afero.Fs) (err error) {
+	return afero.SafeWriteReader(fs, inpath, r)
+}
+
+// WriteToDisk writes content to disk.
+func WriteToDisk(inpath string, r io.Reader, fs afero.Fs) (err error) {
+	return afero.WriteReader(fs, inpath, r)
+}
+
+// OpenFilesForWriting opens all the given filenames for writing.
+func OpenFilesForWriting(fs afero.Fs, filenames ...string) (io.WriteCloser, error) {
+	var writeClosers []io.WriteCloser
+	for _, filename := range filenames {
+		f, err := OpenFileForWriting(fs, filename)
+		if err != nil {
+			for _, wc := range writeClosers {
+				wc.Close()
+			}
+			return nil, err
+		}
+		writeClosers = append(writeClosers, f)
+	}
+
+	return hugio.NewMultiWriteCloser(writeClosers...), nil
+
+}
+
+// OpenFileForWriting opens or creates the given file. If the target directory
+// does not exist, it gets created.
+func OpenFileForWriting(fs afero.Fs, filename string) (afero.File, error) {
+	filename = filepath.Clean(filename)
+	// Create will truncate if file already exists.
+	// os.Create will create any new files with mode 0666 (before umask).
+	f, err := fs.Create(filename)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+		if err = fs.MkdirAll(filepath.Dir(filename), 0777); err != nil { //  before umask
+			return nil, err
+		}
+		f, err = fs.Create(filename)
+	}
+
+	return f, err
+}
+
+// GetCacheDir returns a cache dir from the given filesystem and config.
+// The dir will be created if it does not exist.
+func GetCacheDir(fs afero.Fs, cfg config.Provider) (string, error) {
+	cacheDir := getCacheDir(cfg)
+	if cacheDir != "" {
+		exists, err := DirExists(cacheDir, fs)
+		if err != nil {
+			return "", err
+		}
+		if !exists {
+			err := fs.MkdirAll(cacheDir, 0777) // Before umask
+			if err != nil {
+				return "", _errors.Wrap(err, "failed to create cache dir")
 			}
 		}
+		return cacheDir, nil
 	}
 
-	file, err := fs.Create(inpath)
-	if err != nil {
-		return
-	}
-	defer file.Close()
+	// Fall back to a cache in /tmp.
+	return GetTempDir("hugo_cache", fs), nil
 
-	_, err = io.Copy(file, r)
-	return
 }
 
-// GetTempDir returns the OS default temp directory with trailing slash
-// if subPath is not empty then it will be created recursively with mode 777 rwx rwx rwx
+func getCacheDir(cfg config.Provider) string {
+	// Always use the cacheDir config if set.
+	cacheDir := cfg.GetString("cacheDir")
+	if len(cacheDir) > 1 {
+		return addTrailingFileSeparator(cacheDir)
+	}
+
+	// Both of these are fairly distinctive OS env keys used by Netlify.
+	if os.Getenv("DEPLOY_PRIME_URL") != "" && os.Getenv("PULL_REQUEST") != "" {
+		// Netlify's cache behaviour is not documented, the currently best example
+		// is this project:
+		// https://github.com/philhawksworth/content-shards/blob/master/gulpfile.js
+		return "/opt/build/cache/hugo_cache/"
+
+	}
+
+	// This will fall back to an hugo_cache folder in the tmp dir, which should work fine for most CI
+	// providers. See this for a working CircleCI setup:
+	// https://github.com/bep/hugo-sass-test/blob/6c3960a8f4b90e8938228688bc49bdcdd6b2d99e/.circleci/config.yml
+	// If not, they can set the HUGO_CACHEDIR environment variable or cacheDir config key.
+	return ""
+}
+
+func addTrailingFileSeparator(s string) string {
+	if !strings.HasSuffix(s, FilePathSeparator) {
+		s = s + FilePathSeparator
+	}
+	return s
+}
+
+// GetTempDir returns a temporary directory with the given sub path.
 func GetTempDir(subPath string, fs afero.Fs) string {
-	addSlash := func(p string) string {
-		if FilePathSeparator != p[len(p)-1:] {
-			p = p + FilePathSeparator
-		}
-		return p
-	}
-	dir := addSlash(os.TempDir())
+	return afero.GetTempDir(fs, subPath)
+}
 
-	if subPath != "" {
-		// preserve windows backslash :-(
-		if FilePathSeparator == "\\" {
-			subPath = strings.Replace(subPath, "\\", "____", -1)
-		}
-		dir = dir + MakePath(subPath)
-		if FilePathSeparator == "\\" {
-			dir = strings.Replace(dir, "____", "\\", -1)
-		}
+// DirExists checks if a path exists and is a directory.
+func DirExists(path string, fs afero.Fs) (bool, error) {
+	return afero.DirExists(fs, path)
+}
 
-		if exists, _ := Exists(dir, fs); exists {
-			return addSlash(dir)
-		}
+// IsDir checks if a given path is a directory.
+func IsDir(path string, fs afero.Fs) (bool, error) {
+	return afero.IsDir(fs, path)
+}
 
-		err := fs.MkdirAll(dir, 0777)
-		if err != nil {
-			panic(err)
-		}
-		dir = addSlash(dir)
-	}
-	return dir
+// IsEmpty checks if a given path is empty.
+func IsEmpty(path string, fs afero.Fs) (bool, error) {
+	return afero.IsEmpty(fs, path)
+}
+
+// FileContains checks if a file contains a specified string.
+func FileContains(filename string, subslice []byte, fs afero.Fs) (bool, error) {
+	return afero.FileContainsBytes(fs, filename, subslice)
+}
+
+// FileContainsAny checks if a file contains any of the specified strings.
+func FileContainsAny(filename string, subslices [][]byte, fs afero.Fs) (bool, error) {
+	return afero.FileContainsAnyBytes(fs, filename, subslices)
+}
+
+// Exists checks if a file or directory exists.
+func Exists(path string, fs afero.Fs) (bool, error) {
+	return afero.Exists(fs, path)
 }

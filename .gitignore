@@ -1,4 +1,4 @@
-hugo
+/hugo
 docs/public*
 /.idea
 hugo.exe
@@ -10,3 +10,15 @@ cover.out
 *.swo
 .DS_Store
 *~
+vendor/*/
+*.bench
+*.debug
+coverage*.out
+
+dock.sh
+
+GoBuilds
+dist
+
+
+vendor

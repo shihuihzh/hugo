@@ -1,4 +1,4 @@
-// Copyright © 2014 Steve Francia <spf@spf13.com>.
+// Copyright 2015 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@ package livereload
 
 import (
 	"bytes"
+	"sync"
 
 	"github.com/gorilla/websocket"
 )
@@ -25,6 +26,16 @@ type connection struct {
 
 	// Buffered channel of outbound messages.
 	send chan []byte
+
+	// There is a potential data race, especially visible with large files.
+	// This is protected by synchronisation of the send channel's close.
+	closer sync.Once
+}
+
+func (c *connection) close() {
+	c.closer.Do(func() {
+		close(c.send)
+	})
 }
 
 func (c *connection) reader() {
@@ -33,8 +44,7 @@ func (c *connection) reader() {
 		if err != nil {
 			break
 		}
-		switch true {
-		case bytes.Contains(message, []byte(`"command":"hello"`)):
+		if bytes.Contains(message, []byte(`"command":"hello"`)) {
 			c.send <- []byte(`{
 				"command": "hello",
 				"protocols": [ "http://livereload.com/protocols/official-7" ],

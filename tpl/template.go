@@ -1,4 +1,4 @@
-// Copyright © 2013-14 Steve Francia <spf@spf13.com>.
+// Copyright 2018 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,340 +14,253 @@
 package tpl
 
 import (
-	"bytes"
 	"fmt"
-	"github.com/eknkc/amber"
-	bp "github.com/spf13/hugo/bufferpool"
-	"github.com/spf13/hugo/helpers"
-	"github.com/spf13/hugo/hugofs"
-	jww "github.com/spf13/jwalterweatherman"
-	"github.com/yosssi/ace"
-	"html/template"
 	"io"
-	"io/ioutil"
-	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
+
+	"github.com/gohugoio/hugo/common/herrors"
+
+	"github.com/gohugoio/hugo/hugofs"
+
+	"github.com/spf13/afero"
+
+	"html/template"
+	texttemplate "text/template"
+	"text/template/parse"
+
+	bp "github.com/gohugoio/hugo/bufferpool"
+	"github.com/gohugoio/hugo/metrics"
+	"github.com/pkg/errors"
 )
 
-var localTemplates *template.Template
-var tmpl Template
+var (
+	_ TemplateExecutor = (*TemplateAdapter)(nil)
+)
 
-type Template interface {
-	ExecuteTemplate(wr io.Writer, name string, data interface{}) error
-	Lookup(name string) *template.Template
-	Templates() []*template.Template
-	New(name string) *template.Template
-	LoadTemplates(absPath string)
-	LoadTemplatesWithPrefix(absPath, prefix string)
+// TemplateHandler manages the collection of templates.
+type TemplateHandler interface {
+	TemplateFinder
 	AddTemplate(name, tpl string) error
-	AddAceTemplate(name, basePath, innerPath string, baseContent, innerContent []byte) error
-	AddInternalTemplate(prefix, name, tpl string) error
-	AddInternalShortcode(name, tpl string) error
-	PrintErrors()
+	AddLateTemplate(name, tpl string) error
+	LoadTemplates(prefix string) error
+
+	NewTextTemplate() TemplateParseFinder
+
+	MarkReady()
+	RebuildClone()
 }
 
-type templateErr struct {
-	name string
-	err  error
+// TemplateFinder finds templates.
+type TemplateFinder interface {
+	Lookup(name string) (Template, bool)
 }
 
-type GoHTMLTemplate struct {
-	template.Template
-	errors []*templateErr
+// Template is the common interface between text/template and html/template.
+type Template interface {
+	Execute(wr io.Writer, data interface{}) error
+	Name() string
 }
 
-// The "Global" Template System
-func T() Template {
-	if tmpl == nil {
-		tmpl = New()
+// TemplateParser is used to parse ad-hoc templates, e.g. in the Resource chain.
+type TemplateParser interface {
+	Parse(name, tpl string) (Template, error)
+}
+
+// TemplateParseFinder provides both parsing and finding.
+type TemplateParseFinder interface {
+	TemplateParser
+	TemplateFinder
+}
+
+// TemplateExecutor adds some extras to Template.
+type TemplateExecutor interface {
+	Template
+	ExecuteToString(data interface{}) (string, error)
+	Tree() string
+}
+
+// TemplateDebugger prints some debug info to stdoud.
+type TemplateDebugger interface {
+	Debug()
+}
+
+// TemplateAdapter implements the TemplateExecutor interface.
+type TemplateAdapter struct {
+	Template
+	Metrics metrics.Provider
+
+	// The filesystem where the templates are stored.
+	Fs afero.Fs
+
+	// Maps to base template if relevant.
+	NameBaseTemplateName map[string]string
+}
+
+var baseOfRe = regexp.MustCompile("template: (.*?):")
+
+func extractBaseOf(err string) string {
+	m := baseOfRe.FindStringSubmatch(err)
+	if len(m) == 2 {
+		return m[1]
+	}
+	return ""
+}
+
+// Execute executes the current template. The actual execution is performed
+// by the embedded text or html template, but we add an implementation here so
+// we can add a timer for some metrics.
+func (t *TemplateAdapter) Execute(w io.Writer, data interface{}) (execErr error) {
+	defer func() {
+		// Panics in templates are a little bit too common (nil pointers etc.)
+		// See https://github.com/gohugoio/hugo/issues/5327
+		if r := recover(); r != nil {
+			execErr = t.addFileContext(t.Name(), fmt.Errorf(`panic in Execute: %s. See "https://github.com/gohugoio/hugo/issues/5327" for the reason why we cannot provide a better error message for this.`, r))
+		}
+	}()
+
+	if t.Metrics != nil {
+		defer t.Metrics.MeasureSince(t.Name(), time.Now())
 	}
 
-	return tmpl
-}
-
-// InitializeT resets the internal template state to its initial state
-func InitializeT() Template {
-	tmpl = New()
-	return tmpl
-}
-
-// New returns a new Hugo Template System
-// with all the additional features, templates & functions
-func New() Template {
-	var templates = &GoHTMLTemplate{
-		Template: *template.New(""),
-		errors:   make([]*templateErr, 0),
+	execErr = t.Template.Execute(w, data)
+	if execErr != nil {
+		execErr = t.addFileContext(t.Name(), execErr)
 	}
 
-	localTemplates = &templates.Template
-
-	for k, v := range funcMap {
-		amber.FuncMap[k] = v
-	}
-	templates.Funcs(funcMap)
-	templates.LoadEmbedded()
-	return templates
+	return
 }
 
-func Partial(name string, context_list ...interface{}) template.HTML {
-	if strings.HasPrefix("partials/", name) {
-		name = name[8:]
-	}
-	var context interface{}
+// The identifiers may be truncated in the log, e.g.
+// "executing "main" at <$scaled.SRelPermalin...>: can't evaluate field SRelPermalink in type *resource.Image"
+var identifiersRe = regexp.MustCompile("at \\<(.*?)(\\.{3})?\\>:")
 
-	if len(context_list) == 0 {
-		context = nil
-	} else {
-		context = context_list[0]
+func (t *TemplateAdapter) extractIdentifiers(line string) []string {
+	m := identifiersRe.FindAllStringSubmatch(line, -1)
+	identifiers := make([]string, len(m))
+	for i := 0; i < len(m); i++ {
+		identifiers[i] = m[i][1]
 	}
-	return ExecuteTemplateToHTML(context, "partials/"+name, "theme/partials/"+name)
+	return identifiers
 }
 
-func ExecuteTemplate(context interface{}, buffer *bytes.Buffer, layouts ...string) {
-	worked := false
-	for _, layout := range layouts {
+func (t *TemplateAdapter) addFileContext(name string, inerr error) error {
+	if strings.HasPrefix(t.Name(), "_internal") {
+		return inerr
+	}
 
-		name := layout
+	f, realFilename, err := t.fileAndFilename(t.Name())
+	if err != nil {
+		return inerr
 
-		if localTemplates.Lookup(name) == nil {
-			name = layout + ".html"
+	}
+	defer f.Close()
+
+	master, hasMaster := t.NameBaseTemplateName[name]
+
+	ferr := errors.Wrap(inerr, "execute of template failed")
+
+	// Since this can be a composite of multiple template files (single.html + baseof.html etc.)
+	// we potentially need to look in both -- and cannot rely on line number alone.
+	lineMatcher := func(m herrors.LineMatcher) bool {
+		if m.Position.LineNumber != m.LineNumber {
+			return false
+		}
+		if !hasMaster {
+			return true
 		}
 
-		if localTemplates.Lookup(name) != nil {
-			err := localTemplates.ExecuteTemplate(buffer, name, context)
-			if err != nil {
-				jww.ERROR.Println(err, "in", name)
+		identifiers := t.extractIdentifiers(m.Error.Error())
+
+		for _, id := range identifiers {
+			if strings.Contains(m.Line, id) {
+				return true
 			}
-			worked = true
-			break
 		}
+		return false
 	}
-	if !worked {
-		jww.ERROR.Println("Unable to render", layouts)
-		jww.ERROR.Println("Expecting to find a template in either the theme/layouts or /layouts in one of the following relative locations", layouts)
+
+	fe, ok := herrors.WithFileContext(ferr, realFilename, f, lineMatcher)
+	if ok || !hasMaster {
+		return fe
 	}
-}
 
-func ExecuteTemplateToHTML(context interface{}, layouts ...string) template.HTML {
-	b := bp.GetBuffer()
-	defer bp.PutBuffer(b)
-	ExecuteTemplate(context, b, layouts...)
-	return template.HTML(b.String())
-}
-
-func (t *GoHTMLTemplate) LoadEmbedded() {
-	t.EmbedShortcodes()
-	t.EmbedTemplates()
-}
-
-func (t *GoHTMLTemplate) AddInternalTemplate(prefix, name, tpl string) error {
-	if prefix != "" {
-		return t.AddTemplate("_internal/"+prefix+"/"+name, tpl)
-	} else {
-		return t.AddTemplate("_internal/"+name, tpl)
-	}
-}
-
-func (t *GoHTMLTemplate) AddInternalShortcode(name, content string) error {
-	return t.AddInternalTemplate("shortcodes", name, content)
-}
-
-func (t *GoHTMLTemplate) AddTemplate(name, tpl string) error {
-	_, err := t.New(name).Parse(tpl)
+	// Try the base template if relevant
+	f, realFilename, err = t.fileAndFilename(master)
 	if err != nil {
-		t.errors = append(t.errors, &templateErr{name: name, err: err})
-	}
-	return err
-}
-
-func (t *GoHTMLTemplate) AddAceTemplate(name, basePath, innerPath string, baseContent, innerContent []byte) error {
-	var base, inner *ace.File
-	name = name[:len(name)-len(filepath.Ext(innerPath))] + ".html"
-
-	// Fixes issue #1178
-	basePath = strings.Replace(basePath, "\\", "/", -1)
-	innerPath = strings.Replace(innerPath, "\\", "/", -1)
-
-	if basePath != "" {
-		base = ace.NewFile(basePath, baseContent)
-		inner = ace.NewFile(innerPath, innerContent)
-	} else {
-		base = ace.NewFile(innerPath, innerContent)
-		inner = ace.NewFile("", []byte{})
-	}
-	parsed, err := ace.ParseSource(ace.NewSource(base, inner, []*ace.File{}), nil)
-	if err != nil {
-		t.errors = append(t.errors, &templateErr{name: name, err: err})
 		return err
 	}
-	_, err = ace.CompileResultWithTemplate(t.New(name), parsed, nil)
+	defer f.Close()
+
+	fe, ok = herrors.WithFileContext(ferr, realFilename, f, lineMatcher)
+
+	if !ok {
+		// Return the most specific.
+		return ferr
+
+	}
+	return fe
+
+}
+
+func (t *TemplateAdapter) fileAndFilename(name string) (afero.File, string, error) {
+	fs := t.Fs
+	filename := filepath.FromSlash(name)
+
+	fi, err := fs.Stat(filename)
 	if err != nil {
-		t.errors = append(t.errors, &templateErr{name: name, err: err})
+		return nil, "", err
 	}
-	return err
+	f, err := fs.Open(filename)
+	if err != nil {
+		return nil, "", errors.Wrapf(err, "failed to open template file %q:", filename)
+	}
+
+	return f, fi.(hugofs.RealFilenameInfo).RealFilename(), nil
 }
 
-func (t *GoHTMLTemplate) AddTemplateFile(name, baseTemplatePath, path string) error {
-	// get the suffix and switch on that
-	ext := filepath.Ext(path)
-	switch ext {
-	case ".amber":
-		templateName := strings.TrimSuffix(name, filepath.Ext(name)) + ".html"
-		compiler := amber.New()
-		// Parse the input file
-		if err := compiler.ParseFile(path); err != nil {
-			return err
-		}
+// ExecuteToString executes the current template and returns the result as a
+// string.
+func (t *TemplateAdapter) ExecuteToString(data interface{}) (string, error) {
+	b := bp.GetBuffer()
+	defer bp.PutBuffer(b)
+	if err := t.Execute(b, data); err != nil {
+		return "", err
+	}
+	return b.String(), nil
+}
 
-		if _, err := compiler.CompileWithTemplate(t.New(templateName)); err != nil {
-			return err
-		}
-	case ".ace":
-		var innerContent, baseContent []byte
-		innerContent, err := ioutil.ReadFile(path)
-
-		if err != nil {
-			return err
-		}
-
-		if baseTemplatePath != "" {
-			baseContent, err = ioutil.ReadFile(baseTemplatePath)
-			if err != nil {
-				return err
-			}
-		}
-
-		return t.AddAceTemplate(name, baseTemplatePath, path, baseContent, innerContent)
+// Tree returns the template Parse tree as a string.
+// Note: this isn't safe for parallel execution on the same template
+// vs Lookup and Execute.
+func (t *TemplateAdapter) Tree() string {
+	var tree *parse.Tree
+	switch tt := t.Template.(type) {
+	case *template.Template:
+		tree = tt.Tree
+	case *texttemplate.Template:
+		tree = tt.Tree
 	default:
-		b, err := ioutil.ReadFile(path)
-		if err != nil {
-			return err
-		}
-
-		return t.AddTemplate(name, string(b))
+		panic("Unknown template")
 	}
 
-	return nil
-
-}
-
-func (t *GoHTMLTemplate) GenerateTemplateNameFrom(base, path string) string {
-	name, _ := filepath.Rel(base, path)
-	return filepath.ToSlash(name)
-}
-
-func isDotFile(path string) bool {
-	return filepath.Base(path)[0] == '.'
-}
-
-func isBackupFile(path string) bool {
-	return path[len(path)-1] == '~'
-}
-
-const baseAceFilename = "baseof.ace"
-
-var aceTemplateInnerMarker = []byte("= content")
-
-func isBaseTemplate(path string) bool {
-	return strings.HasSuffix(path, baseAceFilename)
-}
-
-func (t *GoHTMLTemplate) loadTemplates(absPath string, prefix string) {
-	walker := func(path string, fi os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-
-		if fi.Mode()&os.ModeSymlink == os.ModeSymlink {
-			link, err := filepath.EvalSymlinks(absPath)
-			if err != nil {
-				jww.ERROR.Printf("Cannot read symbolic link '%s', error was: %s", absPath, err)
-				return nil
-			}
-			linkfi, err := os.Stat(link)
-			if err != nil {
-				jww.ERROR.Printf("Cannot stat '%s', error was: %s", link, err)
-				return nil
-			}
-			if !linkfi.Mode().IsRegular() {
-				jww.ERROR.Printf("Symbolic links for directories not supported, skipping '%s'", absPath)
-			}
-			return nil
-		}
-
-		if !fi.IsDir() {
-			if isDotFile(path) || isBackupFile(path) || isBaseTemplate(path) {
-				return nil
-			}
-
-			tplName := t.GenerateTemplateNameFrom(absPath, path)
-
-			if prefix != "" {
-				tplName = strings.Trim(prefix, "/") + "/" + tplName
-			}
-
-			var baseTemplatePath string
-
-			// ACE templates may have both a base and inner template.
-			if filepath.Ext(path) == ".ace" && !strings.HasSuffix(filepath.Dir(path), "partials") {
-				// This may be a view that shouldn't have base template
-				// Have to look inside it to make sure
-				needsBase, err := helpers.FileContains(path, aceTemplateInnerMarker, hugofs.OsFs)
-				if err != nil {
-					return err
-				}
-				if needsBase {
-
-					// Look for base template in the follwing order:
-					//   1. <current-path>/<template-name>-baseof.ace, e.g. list-baseof.ace.
-					//   2. <current-path>/baseof.ace
-					//   3. _default/<template-name>-baseof.ace, e.g. list-baseof.ace.
-					//   4. _default/baseof.ace
-					//   5. <themedir>/layouts/_default/<template-name>-baseof.ace
-					//   6. <themedir>/layouts/_default/baseof.ace
-
-					currBaseAceFilename := fmt.Sprintf("%s-%s", helpers.Filename(path), baseAceFilename)
-					templateDir := filepath.Dir(path)
-					themeDir := helpers.GetThemeDir()
-
-					pathsToCheck := []string{
-						filepath.Join(templateDir, currBaseAceFilename),
-						filepath.Join(templateDir, baseAceFilename),
-						filepath.Join(absPath, "_default", currBaseAceFilename),
-						filepath.Join(absPath, "_default", baseAceFilename),
-						filepath.Join(themeDir, "layouts", "_default", currBaseAceFilename),
-						filepath.Join(themeDir, "layouts", "_default", baseAceFilename),
-					}
-
-					for _, pathToCheck := range pathsToCheck {
-						if ok, err := helpers.Exists(pathToCheck, hugofs.OsFs); err == nil && ok {
-							baseTemplatePath = pathToCheck
-							break
-						}
-					}
-				}
-			}
-
-			t.AddTemplateFile(tplName, baseTemplatePath, path)
-
-		}
-		return nil
+	if tree == nil || tree.Root == nil {
+		return ""
 	}
+	s := tree.Root.String()
 
-	filepath.Walk(absPath, walker)
+	return s
 }
 
-func (t *GoHTMLTemplate) LoadTemplatesWithPrefix(absPath string, prefix string) {
-	t.loadTemplates(absPath, prefix)
+// TemplateFuncsGetter allows to get a map of functions.
+type TemplateFuncsGetter interface {
+	GetFuncs() map[string]interface{}
 }
 
-func (t *GoHTMLTemplate) LoadTemplates(absPath string) {
-	t.loadTemplates(absPath, "")
-}
-
-func (t *GoHTMLTemplate) PrintErrors() {
-	for _, e := range t.errors {
-		jww.ERROR.Println(e.err)
-	}
+// TemplateTestMocker adds a way to override some template funcs during tests.
+// The interface is named so it's not used in regular application code.
+type TemplateTestMocker interface {
+	SetFuncs(funcMap map[string]interface{})
 }

@@ -1,4 +1,4 @@
-// Copyright © 2014 Steve Francia <spf@spf13.com>.
+// Copyright 2015 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,9 +21,11 @@ import (
 	"time"
 )
 
+// PageGroup represents a group of pages, grouped by the key.
+// The key is typically a year or similar.
 type PageGroup struct {
-	Key   interface{}
-	Pages Pages
+	Key interface{}
+	Pages
 }
 
 type mapKeyValues []reflect.Value
@@ -63,8 +65,11 @@ func sortKeys(v []reflect.Value, order string) []reflect.Value {
 	return v
 }
 
+// PagesGroup represents a list of page groups.
+// This is what you get when doing page grouping in the templates.
 type PagesGroup []PageGroup
 
+// Reverse reverses the order of this list of page groups.
 func (p PagesGroup) Reverse() PagesGroup {
 	for i, j := 0, len(p)-1; i < j; i, j = i+1, j-1 {
 		p[i], p[j] = p[j], p[i]
@@ -78,6 +83,8 @@ var (
 	pagePtrType = reflect.TypeOf((*Page)(nil))
 )
 
+// GroupBy groups by the value in the given field or method name and with the given order.
+// Valid values for order is asc, desc, rev and reverse.
 func (p Pages) GroupBy(key string, order ...string) (PagesGroup, error) {
 	if len(p) < 1 {
 		return nil, nil
@@ -135,14 +142,17 @@ func (p Pages) GroupBy(key string, order ...string) (PagesGroup, error) {
 		tmp.SetMapIndex(fv, reflect.Append(tmp.MapIndex(fv), ppv))
 	}
 
-	var r []PageGroup
-	for _, k := range sortKeys(tmp.MapKeys(), direction) {
-		r = append(r, PageGroup{Key: k.Interface(), Pages: tmp.MapIndex(k).Interface().([]*Page)})
+	sortedKeys := sortKeys(tmp.MapKeys(), direction)
+	r := make([]PageGroup, len(sortedKeys))
+	for i, k := range sortedKeys {
+		r[i] = PageGroup{Key: k.Interface(), Pages: tmp.MapIndex(k).Interface().([]*Page)}
 	}
 
 	return r, nil
 }
 
+// GroupByParam groups by the given page parameter key's value and with the given order.
+// Valid values for order is asc, desc, rev and reverse.
 func (p Pages) GroupByParam(key string, order ...string) (PagesGroup, error) {
 	if len(p) < 1 {
 		return nil, nil
@@ -157,7 +167,7 @@ func (p Pages) GroupByParam(key string, order ...string) (PagesGroup, error) {
 	var tmp reflect.Value
 	var keyt reflect.Type
 	for _, e := range p {
-		param := e.GetParam(key)
+		param := e.getParamToLower(key)
 		if param != nil {
 			if _, ok := param.([]string); !ok {
 				keyt = reflect.TypeOf(param)
@@ -218,6 +228,10 @@ func (p Pages) groupByDateField(sorter func(p Pages) Pages, formatter func(p *Pa
 	return r, nil
 }
 
+// GroupByDate groups by the given page's Date value in
+// the given format and with the given order.
+// Valid values for order is asc, desc, rev and reverse.
+// For valid format strings, see https://golang.org/pkg/time/#Time.Format
 func (p Pages) GroupByDate(format string, order ...string) (PagesGroup, error) {
 	sorter := func(p Pages) Pages {
 		return p.ByDate()
@@ -228,6 +242,10 @@ func (p Pages) GroupByDate(format string, order ...string) (PagesGroup, error) {
 	return p.groupByDateField(sorter, formatter, order...)
 }
 
+// GroupByPublishDate groups by the given page's PublishDate value in
+// the given format and with the given order.
+// Valid values for order is asc, desc, rev and reverse.
+// For valid format strings, see https://golang.org/pkg/time/#Time.Format
 func (p Pages) GroupByPublishDate(format string, order ...string) (PagesGroup, error) {
 	sorter := func(p Pages) Pages {
 		return p.ByPublishDate()
@@ -238,11 +256,29 @@ func (p Pages) GroupByPublishDate(format string, order ...string) (PagesGroup, e
 	return p.groupByDateField(sorter, formatter, order...)
 }
 
+// GroupByExpiryDate groups by the given page's ExpireDate value in
+// the given format and with the given order.
+// Valid values for order is asc, desc, rev and reverse.
+// For valid format strings, see https://golang.org/pkg/time/#Time.Format
+func (p Pages) GroupByExpiryDate(format string, order ...string) (PagesGroup, error) {
+	sorter := func(p Pages) Pages {
+		return p.ByExpiryDate()
+	}
+	formatter := func(p *Page) string {
+		return p.ExpiryDate.Format(format)
+	}
+	return p.groupByDateField(sorter, formatter, order...)
+}
+
+// GroupByParamDate groups by a date set as a param on the page in
+// the given format and with the given order.
+// Valid values for order is asc, desc, rev and reverse.
+// For valid format strings, see https://golang.org/pkg/time/#Time.Format
 func (p Pages) GroupByParamDate(key string, format string, order ...string) (PagesGroup, error) {
 	sorter := func(p Pages) Pages {
 		var r Pages
 		for _, e := range p {
-			param := e.GetParam(key)
+			param := e.getParamToLower(key)
 			if param != nil {
 				if _, ok := param.(time.Time); ok {
 					r = append(r, e)
@@ -250,13 +286,13 @@ func (p Pages) GroupByParamDate(key string, format string, order ...string) (Pag
 			}
 		}
 		pdate := func(p1, p2 *Page) bool {
-			return p1.GetParam(key).(time.Time).Unix() < p2.GetParam(key).(time.Time).Unix()
+			return p1.getParamToLower(key).(time.Time).Unix() < p2.getParamToLower(key).(time.Time).Unix()
 		}
-		PageBy(pdate).Sort(r)
+		pageBy(pdate).Sort(r)
 		return r
 	}
 	formatter := func(p *Page) string {
-		return p.GetParam(key).(time.Time).Format(format)
+		return p.getParamToLower(key).(time.Time).Format(format)
 	}
 	return p.groupByDateField(sorter, formatter, order...)
 }

@@ -1,4 +1,4 @@
-// Copyright © 2014 Steve Francia <spf@spf13.com>.
+// Copyright 2015 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,10 +13,12 @@
 
 package hugolib
 
+// Prev returns the previous page reletive to the given page.
 func (p Pages) Prev(cur *Page) *Page {
 	for x, c := range p {
-		if c.UniqueID() == cur.UniqueID() {
+		if c.Eq(cur) {
 			if x == 0 {
+				// TODO(bep) consider return nil here to get it line with the other Prevs
 				return p[len(p)-1]
 			}
 			return p[x-1]
@@ -25,12 +27,14 @@ func (p Pages) Prev(cur *Page) *Page {
 	return nil
 }
 
+// Next returns the next page reletive to the given page.
 func (p Pages) Next(cur *Page) *Page {
 	for x, c := range p {
-		if c.UniqueID() == cur.UniqueID() {
+		if c.Eq(cur) {
 			if x < len(p)-1 {
 				return p[x+1]
 			}
+			// TODO(bep) consider return nil here to get it line with the other Nexts
 			return p[0]
 		}
 	}

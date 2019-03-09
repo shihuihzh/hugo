@@ -1,4 +1,4 @@
-// Copyright © 2013 Steve Francia <spf@spf13.com>.
+// Copyright 2018 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,21 +11,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// +build !darwin
+
 package commands
 
 import (
 	"github.com/spf13/cobra"
-	"github.com/spf13/hugo/hugolib"
 )
 
-var check = &cobra.Command{
-	Use:   "check",
-	Short: "Check content in the source directory",
-	Long: `Hugo will perform some basic analysis on the content provided
-and will give feedback.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		InitializeConfig()
-		site := hugolib.Site{}
-		site.Analyze()
+var _ cmder = (*checkCmd)(nil)
+
+type checkCmd struct {
+	*baseCmd
+}
+
+func newCheckCmd() *checkCmd {
+	return &checkCmd{baseCmd: &baseCmd{cmd: &cobra.Command{
+		Use:   "check",
+		Short: "Contains some verification checks",
 	},
+	}}
 }

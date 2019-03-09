@@ -1,4 +1,4 @@
-// Copyright © 2013-14 Steve Francia <spf@spf13.com>.
+// Copyright 2015 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,10 +16,22 @@ package main
 import (
 	"runtime"
 
-	"github.com/spf13/hugo/commands"
+	"os"
+
+	"github.com/gohugoio/hugo/commands"
 )
 
 func main() {
+
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	commands.Execute()
+	resp := commands.Execute(os.Args[1:])
+
+	if resp.Err != nil {
+		if resp.IsUserError() {
+			resp.Cmd.Println("")
+			resp.Cmd.Println(resp.Cmd.UsageString())
+		}
+		os.Exit(-1)
+	}
+
 }

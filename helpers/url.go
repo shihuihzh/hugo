@@ -1,4 +1,4 @@
-// Copyright © 2013-2015 Steve Francia <spf@spf13.com>.
+// Copyright 2015 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,10 +17,10 @@ import (
 	"fmt"
 	"net/url"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/PuerkitoBio/purell"
-	"github.com/spf13/viper"
 )
 
 type pathBridge struct {
@@ -97,24 +97,34 @@ func SanitizeURLKeepTrailingSlash(in string) string {
 	return sanitizeURLWithFlags(in, purell.FlagsSafe|purell.FlagRemoveDotSegments|purell.FlagRemoveDuplicateSlashes|purell.FlagRemoveUnnecessaryHostDots|purell.FlagRemoveEmptyPortSeparator)
 }
 
-// Similar to MakePath, but with Unicode handling
+// URLize is similar to MakePath, but with Unicode handling
 // Example:
 //     uri: Vim (text editor)
 //     urlize: vim-text-editor
-func URLize(uri string) string {
-	sanitized := MakePathSanitized(uri)
+func (p *PathSpec) URLize(uri string) string {
+	return p.URLEscape(p.MakePathSanitized(uri))
 
+}
+
+// URLizeFilename creates an URL from a filename by esacaping unicode letters
+// and turn any filepath separator into forward slashes.
+func (p *PathSpec) URLizeFilename(filename string) string {
+	return p.URLEscape(filepath.ToSlash(filename))
+}
+
+// URLEscape escapes unicode letters.
+func (p *PathSpec) URLEscape(uri string) string {
 	// escape unicode letters
-	parsedUri, err := url.Parse(sanitized)
+	parsedURI, err := url.Parse(uri)
 	if err != nil {
-		// if net/url can not parse URL it's meaning Sanitize works incorrect
+		// if net/url can not parse URL it means Sanitize works incorrectly
 		panic(err)
 	}
-	x := parsedUri.String()
+	x := parsedURI.String()
 	return x
 }
 
-// Combines base URL with content path to create full URL paths.
+// MakePermalink combines base URL with content path to create full URL paths.
 // Example
 //    base:   http://spf13.com/
 //    path:   post/how-i-blog
@@ -146,33 +156,103 @@ func MakePermalink(host, plink string) *url.URL {
 	return base
 }
 
-// AbsURL creates a absolute URL from the relative path given and the BaseURL set in config.
-func AbsURL(path string) string {
-	if strings.HasPrefix(path, "http") || strings.HasPrefix(path, "//") {
-		return path
+// AbsURL creates an absolute URL from the relative path given and the BaseURL set in config.
+func (p *PathSpec) AbsURL(in string, addLanguage bool) string {
+	url, err := url.Parse(in)
+	if err != nil {
+		return in
 	}
-	return MakePermalink(viper.GetString("BaseURL"), path).String()
+
+	if url.IsAbs() || strings.HasPrefix(in, "//") {
+		return in
+	}
+
+	var baseURL string
+	if strings.HasPrefix(in, "/") {
+		u := p.BaseURL.URL()
+		u.Path = ""
+		baseURL = u.String()
+	} else {
+		baseURL = p.BaseURL.String()
+	}
+
+	if addLanguage {
+		prefix := p.GetLanguagePrefix()
+		if prefix != "" {
+			hasPrefix := false
+			// avoid adding language prefix if already present
+			if strings.HasPrefix(in, "/") {
+				hasPrefix = strings.HasPrefix(in[1:], prefix)
+			} else {
+				hasPrefix = strings.HasPrefix(in, prefix)
+			}
+
+			if !hasPrefix {
+				addSlash := in == "" || strings.HasSuffix(in, "/")
+				in = path.Join(prefix, in)
+
+				if addSlash {
+					in += "/"
+				}
+			}
+		}
+	}
+	return MakePermalink(baseURL, in).String()
+}
+
+// IsAbsURL determines whether the given path points to an absolute URL.
+func IsAbsURL(path string) bool {
+	url, err := url.Parse(path)
+	if err != nil {
+		return false
+	}
+
+	return url.IsAbs() || strings.HasPrefix(path, "//")
 }
 
 // RelURL creates a URL relative to the BaseURL root.
 // Note: The result URL will not include the context root if canonifyURLs is enabled.
-func RelURL(path string) string {
-	baseURL := viper.GetString("BaseURL")
-	canonifyURLs := viper.GetBool("canonifyURLs")
-	if (!strings.HasPrefix(path, baseURL) && strings.HasPrefix(path, "http")) || strings.HasPrefix(path, "//") {
-		return path
+func (p *PathSpec) RelURL(in string, addLanguage bool) string {
+	baseURL := p.BaseURL.String()
+	canonifyURLs := p.CanonifyURLs
+	if (!strings.HasPrefix(in, baseURL) && strings.HasPrefix(in, "http")) || strings.HasPrefix(in, "//") {
+		return in
 	}
 
-	u := path
+	u := in
 
-	if strings.HasPrefix(path, baseURL) {
+	if strings.HasPrefix(in, baseURL) {
 		u = strings.TrimPrefix(u, baseURL)
+	}
+
+	if addLanguage {
+		prefix := p.GetLanguagePrefix()
+		if prefix != "" {
+			hasPrefix := false
+			// avoid adding language prefix if already present
+			if strings.HasPrefix(in, "/") {
+				hasPrefix = strings.HasPrefix(in[1:], prefix)
+			} else {
+				hasPrefix = strings.HasPrefix(in, prefix)
+			}
+
+			if !hasPrefix {
+				hadSlash := strings.HasSuffix(u, "/")
+
+				u = path.Join(prefix, u)
+
+				if hadSlash {
+					u += "/"
+				}
+			}
+		}
 	}
 
 	if !canonifyURLs {
 		u = AddContextRoot(baseURL, u)
 	}
-	if path == "" && !strings.HasSuffix(u, "/") && strings.HasSuffix(baseURL, "/") {
+
+	if in == "" && !strings.HasSuffix(u, "/") && strings.HasSuffix(baseURL, "/") {
 		u += "/"
 	}
 
@@ -202,23 +282,39 @@ func AddContextRoot(baseURL, relativePath string) string {
 	return newPath
 }
 
-func URLizeAndPrep(in string) string {
-	return URLPrep(viper.GetBool("UglyURLs"), URLize(in))
+// PrependBasePath prepends any baseURL sub-folder to the given resource
+func (p *PathSpec) PrependBasePath(rel string, isAbs bool) string {
+	basePath := p.GetBasePath(!isAbs)
+	if basePath != "" {
+		rel = filepath.ToSlash(rel)
+		// Need to prepend any path from the baseURL
+		hadSlash := strings.HasSuffix(rel, "/")
+		rel = path.Join(basePath, rel)
+		if hadSlash {
+			rel += "/"
+		}
+	}
+	return rel
 }
 
-func URLPrep(ugly bool, in string) string {
-	if ugly {
-		x := Uglify(SanitizeURL(in))
-		return x
+// URLizeAndPrep applies misc sanitation to the given URL to get it in line
+// with the Hugo standard.
+func (p *PathSpec) URLizeAndPrep(in string) string {
+	return p.URLPrep(p.URLize(in))
+}
+
+// URLPrep applies misc sanitation to the given URL.
+func (p *PathSpec) URLPrep(in string) string {
+	if p.UglyURLs {
+		return Uglify(SanitizeURL(in))
 	}
-	x := PrettifyURL(SanitizeURL(in))
-	if path.Ext(x) == ".xml" {
-		return x
+	pretty := PrettifyURL(SanitizeURL(in))
+	if path.Ext(pretty) == ".xml" {
+		return pretty
 	}
-	url, err := purell.NormalizeURLString(x, purell.FlagAddTrailingSlash)
+	url, err := purell.NormalizeURLString(pretty, purell.FlagAddTrailingSlash)
 	if err != nil {
-		fmt.Printf("ERROR returned by NormalizeURLString. Returning in = %q\n", in)
-		return in
+		return pretty
 	}
 	return url
 }
@@ -268,6 +364,10 @@ func Uglify(in string) string {
 			return d + ext
 		}
 		return in
+	}
+	// /.xml -> /index.xml
+	if name == "" {
+		return path.Dir(in) + "index" + ext
 	}
 	// /section/name.html -> /section/name.html
 	return path.Clean(in)

@@ -1,4 +1,4 @@
-// Copyright © 2013-2015 Steve Francia <spf@spf13.com>.
+// Copyright 2015 The Hugo Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,9 +16,10 @@ package watcher
 import (
 	"time"
 
-	"gopkg.in/fsnotify.v1"
+	"github.com/fsnotify/fsnotify"
 )
 
+// Batcher batches file watch events in a given interval.
 type Batcher struct {
 	*fsnotify.Watcher
 	interval time.Duration
@@ -27,6 +28,7 @@ type Batcher struct {
 	Events chan []fsnotify.Event // Events are returned on this channel
 }
 
+// New creates and starts a Batcher with the given time interval.
 func New(interval time.Duration) (*Batcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 
@@ -64,6 +66,7 @@ OuterLoop:
 	close(b.done)
 }
 
+// Close stops the watching of the files.
 func (b *Batcher) Close() {
 	b.done <- struct{}{}
 	b.Watcher.Close()
